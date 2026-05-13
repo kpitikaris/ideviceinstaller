@@ -32,12 +32,14 @@ permissions:
 
 jobs:
   # ──────────────────────────────────────────────────────────────────────
-  # Linux x86_64 — Ubuntu 22.04 for broad glibc compatibility. Pulls
-  # libplist/glue/usbmuxd/libimobiledevice artifacts (each contains
-  # /usr/local/{include,lib,bin}/...) from their respective upstream CIs.
+  # Linux x86_64 — must match upstream's libplist build runner (currently
+  # ubuntu-latest / 24.04). Older runners trip a glibc ABI mismatch:
+  # upstream's libplist.so references __isoc23_strtoull@GLIBC_2.38, which
+  # only exists from glibc 2.38 onward. Consequence for AMake users: the
+  # bundle requires glibc >= 2.38 (Ubuntu 24.04+, Debian 13+, Fedora 39+).
   # ──────────────────────────────────────────────────────────────────────
   build-linux-x64:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - name: install build deps
         run: |
@@ -308,37 +310,34 @@ jobs:
       - name: stage flat-layout bundle with DLL deps
         run: |
           mkdir -p dist
-          cp src/ideviceinstaller.exe dist/
-          cp /${{ env.dest }}/bin/idevice_id.exe dist/ 2>/dev/null || true
-          # Walk EXE DLL deps via ldd and copy everything from /mingw64/ into
-          # dist/. System DLLs (under /c/Windows) are filtered out.
-          for exe in dist/*.exe; do
-            ldd "$exe" \
-              | grep '=>' \
-              | awk '{print $3}' \
-              | grep -i '/mingw64/' \
+          # Use the installed binaries (real PE files) instead of src/ — the
+          # libtool wrapper at src/ideviceinstaller.exe is a shell script on
+          # MinGW and trips `ldd` later (which then aborts the script under
+          # `set -e -o pipefail`).
+          cp /${{ env.dest }}/bin/ideviceinstaller.exe dist/
+          cp /${{ env.dest }}/bin/idevice_id.exe dist/
+
+          # Walk DLL closure. `ldd` can fail on individual files (libtool
+          # wrappers, .lai files, anything that's not a PE) — tolerate per-
+          # file errors so one bad input doesn't kill the whole step.
+          walk() {
+            ldd "$1" 2>/dev/null \
+              | awk '$3 ~ /\/mingw64\// {print $3}' \
               | sort -u \
               | while read -r dll; do
                   cp -n "$dll" dist/
-                done
-          done
-          # Recursive DLL closure — bundled DLLs themselves may pull in more
+                done || true
+          }
+          for exe in dist/*.exe; do walk "$exe"; done
+          # Recursive closure — bundled DLLs themselves may pull in more
           # /mingw64/ DLLs. Iterate until no new files appear.
           while :; do
             before=$(ls dist/ | wc -l)
-            for dll in dist/*.dll; do
-              ldd "$dll" \
-                | grep '=>' \
-                | awk '{print $3}' \
-                | grep -i '/mingw64/' \
-                | sort -u \
-                | while read -r d; do
-                    cp -n "$d" dist/
-                  done
-            done
+            for dll in dist/*.dll; do walk "$dll"; done
             after=$(ls dist/ | wc -l)
             [ "$before" = "$after" ] && break
           done
+
           # Smoke-check from inside dist/ so DLL resolution exercises the
           # bundled copies, not whatever MSYS2 left in PATH.
           (cd dist && ./ideviceinstaller.exe --help > /dev/null)
