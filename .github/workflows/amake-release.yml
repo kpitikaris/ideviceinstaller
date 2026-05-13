@@ -242,6 +242,7 @@ jobs:
           install: >-
             base-devel
             git
+            zip
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-pkg-config
             mingw-w64-x86_64-openssl
@@ -341,9 +342,7 @@ jobs:
           # Smoke-check from inside dist/ so DLL resolution exercises the
           # bundled copies, not whatever MSYS2 left in PATH.
           (cd dist && ./ideviceinstaller.exe --help > /dev/null)
-          cd dist
-          7z a -tzip ../libimobiledevice-bundle-win-x64.zip *
-          cd ..
+          (cd dist && zip -r ../libimobiledevice-bundle-win-x64.zip .)
           ls -la libimobiledevice-bundle-win-x64.zip
 
       - uses: actions/upload-artifact@v4
