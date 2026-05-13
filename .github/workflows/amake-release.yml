@@ -5,14 +5,21 @@ name: amake-release-build
 # Consumed by AMake's managed-tools fetcher; the produced asset names are
 # referenced verbatim from AMake's src/AMake.Platform/Tools/tools.json.
 #
+# Approach: mirror upstream's own build.yml — fetch prebuilt libplist /
+# libimobiledevice-glue / libusbmuxd / libimobiledevice artifacts from the
+# respective libimobiledevice/<repo>'s CI, extract into the right prefix,
+# build only ideviceinstaller here, then repackage into a flat dist/.
+#
+# Why not build deps from source: libimobiledevice 1.4.0 needs libtatsu,
+# and the MinGW dllimport ABI for static libs is fragile — upstream's
+# per-repo CIs already handle both correctly, so we piggy-back.
+#
 # Trigger:
 #   git tag amake-1.2.0 && git push origin amake-1.2.0
 #
 # Or via the GitHub UI: Actions → amake-release-build → Run workflow.
-#
-# Tag pattern `amake-*` keeps this workflow distinct from upstream's regular
-# CI tags (just the version number, e.g. 1.2.0) — pushing 1.2.0 won't fire
-# this build, only amake-* tags do.
+# (workflow_dispatch builds the bundles but skips the release-create step;
+# only tag pushes produce a public release page.)
 
 on:
   push:
@@ -23,29 +30,15 @@ on:
 permissions:
   contents: write   # needed for the release-create step in the final job
 
-env:
-  # Pin upstream dependency refs. Bump these when you want a newer dep
-  # snapshot; AMake's tools.json sha256 will need updating for every build
-  # whose binary contents change.
-  LIBPLIST_REF:               master
-  LIBIMOBILEDEVICE_GLUE_REF:  1.3.2
-  LIBUSBMUXD_REF:             2.1.1
-  LIBIMOBILEDEVICE_REF:       1.4.0
-
 jobs:
   # ──────────────────────────────────────────────────────────────────────
-  # Linux x86_64 — built on Ubuntu 22.04 for broad glibc compatibility
-  # (works on every distro from Debian 11 / RHEL 9 / Ubuntu 22.04+).
-  # Static-linked everything except system libraries (openssl, zlib, libc).
+  # Linux x86_64 — Ubuntu 22.04 for broad glibc compatibility. Pulls
+  # libplist/glue/usbmuxd/libimobiledevice artifacts (each contains
+  # /usr/local/{include,lib,bin}/...) from their respective upstream CIs.
   # ──────────────────────────────────────────────────────────────────────
   build-linux-x64:
     runs-on: ubuntu-22.04
     steps:
-      - name: checkout self
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: install build deps
         run: |
           sudo apt-get update
@@ -53,58 +46,76 @@ jobs:
             autoconf automake libtool pkg-config \
             libssl-dev libzip-dev zlib1g-dev
 
-      - name: build libplist
-        run: |
-          git clone https://github.com/libimobiledevice/libplist.git ../libplist
-          cd ../libplist
-          git checkout "$LIBPLIST_REF"
-          ./autogen.sh --prefix=/usr/local --disable-shared --enable-static --without-cython
-          make -j"$(nproc)"
-          sudo make install
+      - name: prepare environment
+        run: echo "target_triplet=$(gcc -dumpmachine)" >> "$GITHUB_ENV"
 
-      - name: build libimobiledevice-glue
-        run: |
-          git clone https://github.com/libimobiledevice/libimobiledevice-glue.git ../libimobiledevice-glue
-          cd ../libimobiledevice-glue
-          git checkout "$LIBIMOBILEDEVICE_GLUE_REF"
-          ./autogen.sh --prefix=/usr/local --disable-shared --enable-static
-          make -j"$(nproc)"
-          sudo make install
+      - name: fetch libplist
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: build.yml
+          name: libplist-latest_${{ env.target_triplet }}
+          repo: libimobiledevice/libplist
 
-      - name: build libusbmuxd
-        run: |
-          git clone https://github.com/libimobiledevice/libusbmuxd.git ../libusbmuxd
-          cd ../libusbmuxd
-          git checkout "$LIBUSBMUXD_REF"
-          ./autogen.sh --prefix=/usr/local --disable-shared --enable-static
-          make -j"$(nproc)"
-          sudo make install
+      - name: fetch libimobiledevice-glue
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: build.yml
+          name: libimobiledevice-glue-latest_${{ env.target_triplet }}
+          repo: libimobiledevice/libimobiledevice-glue
 
-      - name: build libimobiledevice
+      - name: fetch libusbmuxd
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: build.yml
+          name: libusbmuxd-latest_${{ env.target_triplet }}
+          repo: libimobiledevice/libusbmuxd
+
+      - name: fetch libimobiledevice
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: build.yml
+          name: libimobiledevice-latest_${{ env.target_triplet }}
+          repo: libimobiledevice/libimobiledevice
+
+      - name: install fetched deps into /
         run: |
-          git clone https://github.com/libimobiledevice/libimobiledevice.git ../libimobiledevice
-          cd ../libimobiledevice
-          git checkout "$LIBIMOBILEDEVICE_REF"
-          ./autogen.sh --prefix=/usr/local --disable-shared --enable-static --without-cython
-          make -j"$(nproc)"
-          sudo make install
+          mkdir extract
+          for I in *.tar; do
+            tar -C extract -xvf "$I"
+          done
+          sudo cp -r extract/* /
+          sudo ldconfig
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: build ideviceinstaller (this fork)
         run: |
           ./autogen.sh PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
           make -j"$(nproc)"
+          sudo make install
 
       - name: stage flat-layout bundle
         run: |
           mkdir -p dist
           cp src/ideviceinstaller dist/
-          # idevice_id ships from libimobiledevice's tools/ — companion utility
-          # for `amake sideload-ipa --device <udid>` (lists connected devices).
           cp /usr/local/bin/idevice_id dist/ || true
-          strip dist/* || true
-          # Smoke-check: the binary must run and report a version.
-          ./dist/ideviceinstaller --help > /dev/null
+          # ideviceinstaller links shared against the libimobiledevice stack —
+          # copy the .so deps so the bundle is self-contained.
+          for so in libplist-2.0 libimobiledevice-glue-1.0 libusbmuxd-2.0 libimobiledevice-1.0 libtatsu-1.0; do
+            cp /usr/local/lib/${so}.so* dist/ 2>/dev/null || true
+          done
+          strip dist/ideviceinstaller dist/idevice_id 2>/dev/null || true
+          # Smoke-check: must run and report something (the bundled .sos must
+          # be picked up via $ORIGIN/lib search, hence LD_LIBRARY_PATH=dist).
+          LD_LIBRARY_PATH=dist ./dist/ideviceinstaller --help > /dev/null
           tar -czf libimobiledevice-bundle-linux-x64.tar.gz -C dist .
+          ls -la libimobiledevice-bundle-linux-x64.tar.gz
 
       - uses: actions/upload-artifact@v4
         with:
@@ -113,73 +124,95 @@ jobs:
           retention-days: 7
 
   # ──────────────────────────────────────────────────────────────────────
-  # macOS arm64 — Apple Silicon. macOS x64 is past Apple's support window
-  # (last Intel Mac is 2019); skip unless explicitly needed later.
+  # macOS arm64 — Apple Silicon. Upstream's macOS artifacts are universal
+  # (arm64 + x86_64), but we just take the arm64 slice for AMake's osx-arm64
+  # RID. macOS x64 (osx-x64) is past Apple's support window, skipped.
   # ──────────────────────────────────────────────────────────────────────
   build-macos-arm64:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: install build deps (Homebrew)
-        run: |
-          brew install autoconf automake libtool pkg-config openssl@3 libzip
+        run: brew install autoconf automake libtool pkg-config openssl@3 libzip
 
-      - name: configure pkg-config to find openssl + libzip
-        run: |
-          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix libzip)/lib/pkgconfig:/usr/local/lib/pkgconfig" >> "$GITHUB_ENV"
+      - name: fetch libplist
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: build.yml
+          name: libplist-latest_macOS
+          repo: libimobiledevice/libplist
 
-      - name: build libplist
-        run: |
-          git clone https://github.com/libimobiledevice/libplist.git ../libplist
-          cd ../libplist
-          git checkout "$LIBPLIST_REF"
-          ./autogen.sh --prefix=/usr/local --disable-shared --enable-static --without-cython
-          make -j"$(sysctl -n hw.ncpu)"
-          sudo make install
+      - name: fetch libimobiledevice-glue
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: build.yml
+          name: libimobiledevice-glue-latest_macOS
+          repo: libimobiledevice/libimobiledevice-glue
 
-      - name: build libimobiledevice-glue
-        run: |
-          git clone https://github.com/libimobiledevice/libimobiledevice-glue.git ../libimobiledevice-glue
-          cd ../libimobiledevice-glue
-          git checkout "$LIBIMOBILEDEVICE_GLUE_REF"
-          ./autogen.sh --prefix=/usr/local --disable-shared --enable-static
-          make -j"$(sysctl -n hw.ncpu)"
-          sudo make install
+      - name: fetch libusbmuxd
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: build.yml
+          name: libusbmuxd-latest_macOS
+          repo: libimobiledevice/libusbmuxd
 
-      - name: build libusbmuxd
-        run: |
-          git clone https://github.com/libimobiledevice/libusbmuxd.git ../libusbmuxd
-          cd ../libusbmuxd
-          git checkout "$LIBUSBMUXD_REF"
-          ./autogen.sh --prefix=/usr/local --disable-shared --enable-static
-          make -j"$(sysctl -n hw.ncpu)"
-          sudo make install
+      - name: fetch libimobiledevice
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: build.yml
+          name: libimobiledevice-latest_macOS
+          repo: libimobiledevice/libimobiledevice
 
-      - name: build libimobiledevice
+      - name: install fetched deps into /
         run: |
-          git clone https://github.com/libimobiledevice/libimobiledevice.git ../libimobiledevice
-          cd ../libimobiledevice
-          git checkout "$LIBIMOBILEDEVICE_REF"
-          ./autogen.sh --prefix=/usr/local --disable-shared --enable-static --without-cython
-          make -j"$(sysctl -n hw.ncpu)"
-          sudo make install
+          mkdir extract
+          for I in *.tar; do
+            tar -C extract -xvf "$I"
+          done
+          sudo cp -r extract/* /
+
+      - uses: actions/checkout@v4
 
       - name: build ideviceinstaller (this fork)
         run: |
-          ./autogen.sh PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+          export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix libzip)/lib/pkgconfig"
+          ./autogen.sh PKG_CONFIG_PATH="$PKG_CONFIG_PATH"
           make -j"$(sysctl -n hw.ncpu)"
+          sudo make install
 
       - name: stage flat-layout bundle
         run: |
           mkdir -p dist
           cp src/ideviceinstaller dist/
           cp /usr/local/bin/idevice_id dist/ || true
-          # macOS strip is more conservative than GNU strip; skipping.
+          # macOS dylibs from upstream's artifacts:
+          for dylib in libplist-2.0 libimobiledevice-glue-1.0 libusbmuxd-2.0 libimobiledevice-1.0 libtatsu-1.0; do
+            cp /usr/local/lib/${dylib}.*.dylib dist/ 2>/dev/null || true
+            cp /usr/local/lib/${dylib}.dylib   dist/ 2>/dev/null || true
+          done
+          # Rewrite install names so the bundled dylibs resolve via @loader_path
+          # — that lets users drop the bundle anywhere without DYLD games.
+          for f in dist/ideviceinstaller dist/idevice_id; do
+            [ -f "$f" ] || continue
+            for dep_path in $(otool -L "$f" | awk 'NR>1 {print $1}' | grep '/usr/local/lib/'); do
+              dep_base=$(basename "$dep_path")
+              install_name_tool -change "$dep_path" "@loader_path/$dep_base" "$f" || true
+            done
+          done
+          for f in dist/*.dylib; do
+            [ -f "$f" ] || continue
+            install_name_tool -id "@loader_path/$(basename "$f")" "$f" || true
+            for dep_path in $(otool -L "$f" | awk 'NR>1 {print $1}' | grep '/usr/local/lib/'); do
+              dep_base=$(basename "$dep_path")
+              install_name_tool -change "$dep_path" "@loader_path/$dep_base" "$f" || true
+            done
+          done
           ./dist/ideviceinstaller --help > /dev/null
           tar -czf libimobiledevice-bundle-osx-arm64.tar.gz -C dist .
+          ls -la libimobiledevice-bundle-osx-arm64.tar.gz
 
       - uses: actions/upload-artifact@v4
         with:
@@ -188,10 +221,9 @@ jobs:
           retention-days: 7
 
   # ──────────────────────────────────────────────────────────────────────
-  # Windows x64 — MSYS2 / MINGW64 build. Produces ideviceinstaller.exe
-  # plus the runtime DLLs it depends on (openssl, libzip, libwinpthread,
-  # libgcc). All bundled flat next to the .exe so the Windows DLL search
-  # order finds them automatically.
+  # Windows x64 — MSYS2 / MINGW64. Pulls upstream's prebuilt MINGW64
+  # artifacts; each contains mingw64/{include,lib,bin}. Result is
+  # ideviceinstaller.exe + idevice_id.exe + bundled runtime DLLs.
   # ──────────────────────────────────────────────────────────────────────
   build-windows-x64:
     runs-on: windows-latest
@@ -199,76 +231,87 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: install MSYS2 + MINGW64 toolchain
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-          update: true
+          release: false
+          update: false
           install: >-
             base-devel
             git
-            mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkg-config
             mingw-w64-x86_64-openssl
             mingw-w64-x86_64-libzip
             mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-xz
+            mingw-w64-x86_64-bzip2
             autoconf
-            automake
+            automake-wrapper
             libtool
 
-      - name: build libplist
+      - name: prepare environment
         run: |
-          git clone https://github.com/libimobiledevice/libplist.git ../libplist
-          cd ../libplist
-          git checkout "$LIBPLIST_REF"
-          ./autogen.sh --prefix=/mingw64 --disable-shared --enable-static --without-cython
-          make -j"$(nproc)"
-          make install
+          dest=mingw64
+          echo "dest=$dest" >> "$GITHUB_ENV"
+          echo "target_triplet=$(gcc -dumpmachine)" >> "$GITHUB_ENV"
 
-      - name: build libimobiledevice-glue
-        run: |
-          git clone https://github.com/libimobiledevice/libimobiledevice-glue.git ../libimobiledevice-glue
-          cd ../libimobiledevice-glue
-          git checkout "$LIBIMOBILEDEVICE_GLUE_REF"
-          ./autogen.sh --prefix=/mingw64 --disable-shared --enable-static
-          make -j"$(nproc)"
-          make install
+      - name: fetch libplist
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: build.yml
+          name: libplist-latest_x86_64-${{ env.dest }}
+          repo: libimobiledevice/libplist
 
-      - name: build libusbmuxd
-        run: |
-          git clone https://github.com/libimobiledevice/libusbmuxd.git ../libusbmuxd
-          cd ../libusbmuxd
-          git checkout "$LIBUSBMUXD_REF"
-          ./autogen.sh --prefix=/mingw64 --disable-shared --enable-static
-          make -j"$(nproc)"
-          make install
+      - name: fetch libimobiledevice-glue
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: build.yml
+          name: libimobiledevice-glue-latest_x86_64-${{ env.dest }}
+          repo: libimobiledevice/libimobiledevice-glue
 
-      - name: build libimobiledevice
+      - name: fetch libusbmuxd
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: build.yml
+          name: libusbmuxd-latest_x86_64-${{ env.dest }}
+          repo: libimobiledevice/libusbmuxd
+
+      - name: fetch libimobiledevice
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          workflow: build.yml
+          name: libimobiledevice-latest_x86_64-${{ env.dest }}
+          repo: libimobiledevice/libimobiledevice
+
+      - name: install fetched deps into MSYS2 root
         run: |
-          git clone https://github.com/libimobiledevice/libimobiledevice.git ../libimobiledevice
-          cd ../libimobiledevice
-          git checkout "$LIBIMOBILEDEVICE_REF"
-          ./autogen.sh --prefix=/mingw64 --disable-shared --enable-static --without-cython
-          make -j"$(nproc)"
-          make install
+          mkdir extract
+          for I in *.tar; do
+            tar -C extract -xvf "$I"
+          done
+          cp -r extract/* /
+
+      - uses: actions/checkout@v4
 
       - name: build ideviceinstaller (this fork)
         run: |
-          ./autogen.sh PKG_CONFIG_PATH=/mingw64/lib/pkgconfig
+          ./autogen.sh PKG_CONFIG_PATH=/${{ env.dest }}/lib/pkgconfig
           make -j"$(nproc)"
+          make install
 
       - name: stage flat-layout bundle with DLL deps
         run: |
           mkdir -p dist
           cp src/ideviceinstaller.exe dist/
-          cp /mingw64/bin/idevice_id.exe dist/ 2>/dev/null || true
-          # Walk the EXE's DLL deps via `ldd` (MSYS2 has the GNU one) and copy
-          # everything from /mingw64/bin into dist/. Only system-DLLs (under
-          # /c/Windows) are skipped.
+          cp /${{ env.dest }}/bin/idevice_id.exe dist/ 2>/dev/null || true
+          # Walk EXE DLL deps via ldd and copy everything from /mingw64/ into
+          # dist/. System DLLs (under /c/Windows) are filtered out.
           for exe in dist/*.exe; do
             ldd "$exe" \
               | grep '=>' \
@@ -279,10 +322,26 @@ jobs:
                   cp -n "$dll" dist/
                 done
           done
-          # Smoke-check from the dist dir so DLL resolution actually exercises
-          # the bundled copies.
+          # Recursive DLL closure — bundled DLLs themselves may pull in more
+          # /mingw64/ DLLs. Iterate until no new files appear.
+          while :; do
+            before=$(ls dist/ | wc -l)
+            for dll in dist/*.dll; do
+              ldd "$dll" \
+                | grep '=>' \
+                | awk '{print $3}' \
+                | grep -i '/mingw64/' \
+                | sort -u \
+                | while read -r d; do
+                    cp -n "$d" dist/
+                  done
+            done
+            after=$(ls dist/ | wc -l)
+            [ "$before" = "$after" ] && break
+          done
+          # Smoke-check from inside dist/ so DLL resolution exercises the
+          # bundled copies, not whatever MSYS2 left in PATH.
           (cd dist && ./ideviceinstaller.exe --help > /dev/null)
-          # zip with native paths.
           cd dist
           7z a -tzip ../libimobiledevice-bundle-win-x64.zip *
           cd ..
@@ -295,9 +354,9 @@ jobs:
           retention-days: 7
 
   # ──────────────────────────────────────────────────────────────────────
-  # Release — only fires on tag push, never on workflow_dispatch (no tag,
-  # nowhere to attach). Pulls every per-platform artifact, computes
-  # SHA256SUMS.txt, creates the GitHub Release with everything attached.
+  # Release — only fires on tag push. Pulls every per-platform artifact,
+  # computes SHA256SUMS.txt, creates the GitHub Release with everything
+  # attached. workflow_dispatch runs the three builds but skips this job.
   # ──────────────────────────────────────────────────────────────────────
   release:
     needs: [build-linux-x64, build-macos-arm64, build-windows-x64]
@@ -325,11 +384,11 @@ jobs:
           gh release create "$tag" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$tag" \
-            --notes "AMake-bundled libimobiledevice + ideviceinstaller. Pinned upstream refs:
-            - libplist:                $LIBPLIST_REF
-            - libimobiledevice-glue:   $LIBIMOBILEDEVICE_GLUE_REF
-            - libusbmuxd:              $LIBUSBMUXD_REF
-            - libimobiledevice:        $LIBIMOBILEDEVICE_REF
+            --notes "AMake-bundled libimobiledevice + ideviceinstaller.
 
-            See SHA256SUMS.txt for asset hashes." \
+          Deps fetched from each libimobiledevice/<repo>'s latest build.yml
+          artifact (libplist, libimobiledevice-glue, libusbmuxd,
+          libimobiledevice — itself transitively including libtatsu).
+
+          See SHA256SUMS.txt for asset hashes." \
             artifacts/*
